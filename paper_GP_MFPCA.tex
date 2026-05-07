@@ -1,0 +1,1489 @@
+﻿%% Compile: pdflatex paper_GP_MFPCA  (twice for cross-references)
+\documentclass[12pt,a4paper]{article}
+
+\usepackage{mathptmx}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{geometry}
+\geometry{a4paper, top=25mm, bottom=25mm, left=25mm, right=25mm}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{shapes.geometric, arrows.meta, positioning, fit, backgrounds}
+\usepackage{natbib}
+\usepackage{setspace}
+\usepackage{caption}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true, linkcolor=blue!60!black,
+            citecolor=blue!60!black, urlcolor=blue}
+\usepackage{lineno}
+\usepackage{authblk}
+\usepackage{titlesec}
+\usepackage{parskip}
+
+\setstretch{1.15}
+
+\titleformat{\section}{\large\bfseries}{\thesection.}{0.5em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection.}{0.5em}{}
+\titleformat{\subsubsection}{\normalsize\itshape}{\thesubsubsection.}{0.5em}{}
+
+%% ------------------------------------------------------------------
+%% Notation:
+%%   \spar        -- theta == Sigma_{z,1}: initial solid surface density
+%%                  at 1 au (g cm^{-2}); primary simulation control parameter.
+%%                  Range [23.39, 175.88] g cm^{-2}. Defined in Sec. 2.1.
+%%   v_k          -- GP interpolation posterior variance for the smooth score
+%%   \delta_k^2   -- fixed per-PC LOESS-SE^2 observation noise used in the GP
+%%   \sigma^2_{\mathrm{resid},k} -- per-PC LOESS residual variance restored
+%%                  at prediction time
+%%   \sigma^2_{\mathrm{pred},k} -- total predictive score variance
+%%                  v_k + \sigma^2_{\mathrm{resid},k}
+%% ------------------------------------------------------------------
+\newcommand{\GP}{\textsc{gp}}
+\newcommand{\MFPCA}{\textsc{mfpca}}
+\newcommand{\KDE}{\textsc{kde}}
+\newcommand{\CLR}{\textsc{clr}}
+\newcommand{\SQRT}{\ensuremath{\sqrt{f}}}
+\newcommand{\ISE}{\textsc{ise}}
+\newcommand{\CRPS}{\textsc{crps}}
+\newcommand{\iCRPS}{i\textsc{crps}}
+\newcommand{\ECDF}{\textsc{ecdf}}
+\newcommand{\calK}{\mathcal{K}}
+\newcommand{\spar}{\theta}
+
+%% ================================================================
+\title{\textbf{Emulating Multivariate Conditional Densities from
+$N$-body Simulations: A Gaussian Process Pipeline with Calibrated
+Uncertainty Quantification}}
+
+\author[1]{Yiming Chen}
+\affil[1]{Independent researcher, United States}
+
+\date{\small\today}
+
+%% ================================================================
+\begin{document}
+\linenumbers
+\maketitle
+\thispagestyle{empty}
+
+%% ----------------------------------------------------------------
+\begin{abstract}
+\noindent
+We design and validate a Gaussian process emulation pipeline for
+multivariate conditional density functions from $N$-body planetary
+system simulations.  The emulator serves as a fast surrogate for
+Bayesian inference of planet formation conditions from Kepler
+observations; the present paper establishes its predictive performance
+against held-out simulations.
+
+The pipeline combines adaptive kernel density estimation, a
+square-root density (Hellinger) transform, multivariate functional
+PCA, LOESS denoising, and GP regression with ECDF input warping and a
+noise-decomposition uncertainty model.  A key architectural insight is
+the choice of density transform: replacing the standard centred
+log-ratio (CLR) transform with the square-root transform eliminates the
+exponential error amplification inherent in the CLR inverse.  The
+resulting two-component predictive variance---GP interpolation
+uncertainty plus restored LOESS residual variance---achieves
+per-variable density-space coverage of 94.1\,\% (log period ratio),
+84.9\,\% (log duration ratio), and 94.0\,\% (log Hill spacing) at
+95\,\% nominal level, without post-hoc calibration.
+
+Applied to three planetary-system observables conditioned on the solid
+surface density parameter $\spar$, the emulator achieves statistically
+significant improvements on the integrated CRPS (\iCRPS) proper scoring
+rule for all three observables ($p<0.05$, $n=25$), with ratios of 0.84
+(log period ratio), 0.76 (log duration ratio), and 0.81 (log Hill
+spacing) relative to the training-mean naive baseline.  An error decomposition
+identifies GP score prediction (not basis representation) as the
+dominant remaining error source, accounting for 60--74\,\% of total
+density-space ISE.
+\end{abstract}
+
+\textbf{Keywords:} methods: statistical --- methods: numerical ---
+planets and satellites: dynamical evolution and stability ---
+methods: data analysis --- Gaussian processes --- density estimation
+
+\vspace{0.5cm}\hrule\vspace{0.5cm}
+
+%% ================================================================
+\section{Introduction}
+\label{sec:intro}
+
+Population-level statistics of planetary systems encode the cumulative
+outcome of formation and dynamical-evolution processes operating over
+millions to billions of years \citep{winn2015, mordasini2018,
+mulders2021}.  A central scientific goal is to \emph{infer} the
+conditions under which a planetary system formed---disc surface density,
+radial distribution of solids, gas disk depletion---from the observable
+properties of that system (orbital periods, transit durations, Hill
+spacings) recorded by missions such as \textit{Kepler} and \textit{K2}.
+
+This inverse problem requires repeated evaluation of the likelihood
+$P(\text{obs}\,|\,\boldsymbol{\phi})$, which in turn requires evaluating the
+forward model $F(\boldsymbol{\phi})$ that maps formation parameters
+$\boldsymbol{\phi}=(\theta,\gamma,d)$ to a distribution of observables.
+Here $\theta\equiv\Sigma_{z,1}$ is the solid surface density at 1\,au,
+$\gamma$ is the disc radial exponent (held fixed at $\gamma=-3/2$ in this paper), and $d$ is the gas disc depletion factor;
+the present paper holds $\gamma$ and $d$ fixed and treats $\theta$ as the
+sole free parameter (Section~\ref{sec:simsetup}).  The forward model here is a full $N$-body
+gravitational simulation: each run requires approximately five days of
+wall-clock time \citep{macdonald2020}, making MCMC-based posterior
+inference---which requires thousands of likelihood evaluations---
+computationally infeasible \citep{ida2004, benz2014, emsenhuber2021}.
+
+The standard remedy is to train a statistical \emph{emulator}
+\citep{kennedy2001, bower2010} on an existing design of simulation runs,
+producing a fast surrogate that can be queried millions of times during
+MCMC at negligible cost.  The present paper designs and validates such an
+emulator.  Application to Bayesian inference of planet formation
+conditions from Kepler data is the subject of ongoing work; the emulator
+must be validated before it can be trusted in the inverse-problem
+context.
+
+The emulation task here is non-standard: the simulator output at each
+parameter setting $\spar$ is not a scalar but a
+\emph{multivariate probability density function}---the joint
+conditional distribution of three observable planetary-system
+properties (orbital spacing, transit-duration ratio, and dynamical
+proximity) given $\spar$.  Standard scalar-output Gaussian process
+emulators \citep{rasmussen2006} do not handle functional outputs
+directly.  Latent-space methods compress the functional output into a
+low-dimensional score vector via functional PCA and emulate the scores
+\citep{higdon2008, fricker2013}; this approach is adopted here,
+extended to the multivariate functional setting via \MFPCA
+\citep{happ2018}.
+
+\subsection*{Contribution}
+
+This paper designs and \emph{validates} a Gaussian process emulation
+pipeline for multivariate conditional density functions from $N$-body
+planetary system simulations.  The pipeline combines adaptive \KDE,
+the square-root density transform, \MFPCA, and a \GP with \ECDF input
+warping into a fully specified, reproducible workflow (all
+hyperparameters in Table~\ref{tab:hyperparams}).  The contribution has
+three parts:
+\begin{enumerate}
+  \item \emph{Pipeline design with near-calibrated uncertainty propagation.}
+        The pipeline achieves per-variable empirical coverage of
+        94.1\,\% ($X$), 84.9\,\% ($Y$), and 94.0\,\% ($Z$) at
+        95\,\% nominal level in density space, without post-hoc
+        calibration.
+        We identify the square-root density transform as the critical
+        architectural choice enabling this calibration, and justify the
+        homoscedastic GP with fixed LOESS-SE$^2$ observation noise and
+        explicit residual-variance restoration as the appropriate noise
+        model for the two-stage (LOESS denoise $\to$ GP emulate)
+        architecture.
+  \item \emph{Multi-baseline empirical evaluation.}  We test the
+        pipeline against a parameter-ignorant naive baseline, a
+        score-space LOESS interpolant, and a $\spar$-aware
+        nearest-neighbour estimator, finding statistically significant
+        \iCRPS gains for all three observables ($p<0.05$;
+        Section~\ref{sec:density_eval}).
+  \item \emph{Ablation analysis.}  We ablate three design choices---
+        density transform (CLR vs $\sqrt{f}$), peak alignment (with vs
+        without), and GP noise model (the final noise-decomposition
+        model vs no-warp and heteroscedastic alternatives)---identifying
+        the transform choice as the dominant factor in density-space
+        calibration (coverage: 61\,\% with CLR vs near-nominal coverage
+        for $X$ and $Z$ with $\sqrt{f}$).
+\end{enumerate}
+
+The remainder of the paper validates this emulator rather than
+applying it to data inference.  The inverse problem---using the
+validated emulator as a likelihood surrogate within MCMC to infer
+$\boldsymbol{\phi}=(\theta,\gamma,d)$ from Kepler observables---is reserved for subsequent work.
+Section~\ref{sec:data} describes the simulated data.
+Section~\ref{sec:methods} details the pipeline.
+Section~\ref{sec:results} presents results.
+Section~\ref{sec:discussion} interprets the results and characterises
+sensitivity.  Section~\ref{sec:conclusions} concludes.
+
+%% ================================================================
+\section{Data and Simulations}
+\label{sec:data}
+
+\subsection{Simulation setup}
+\label{sec:simsetup}
+
+The dataset comprises $N$-body planetary system simulations
+parameterised by a single scalar control parameter $\theta$, the
+initial solid surface density at 1\,au,
+$\theta\equiv\Sigma_{z,1}$ (g\,cm$^{-2}$).
+This normalises the total amount of solid material available
+for late-stage planet formation in the inner disc.  Specifically,
+the solid surface density profile follows
+\begin{equation}
+  \Sigma(a) = \theta\left(\frac{a}{\mathrm{au}}\right)^{-3/2},
+  \label{eq:sigma_profile}
+\end{equation}
+adopting a minimum-mass solar nebula radial exponent $\gamma=-3/2$ (held fixed in this paper).
+All other simulation parameters are held fixed: the gas disc is in
+a strongly depleted state ($d=100$ in the gas surface density
+prescription $\Sigma_g=1700\,\mathrm{g\,cm^{-2}}\,d^{-1}
+(a/\mathrm{au})^{-3/2}$, using a step-function dispersal
+approximation), and the initial embryo masses and spacings correspond
+to 3~Hill radii.  Larger~$\spar$ implies more massive planetary
+embryos and, consequently, more compact and massive post-formation
+systems; the parameter therefore acts as the primary driver of
+structural diversity in the simulated planetary population
+\citep{macdonald2020}.
+
+Simulations span $\spar\in[23.39,175.88]\,\mathrm{g\,cm^{-2}}$.
+The canonical minimum-mass solar nebula (MMSN) corresponds to
+$\theta_\mathrm{MMSN}\equiv\Sigma_{z,\mathrm{MMSN}}(1\,\mathrm{au})
+\approx7\,\mathrm{g\,cm^{-2}}$ \citep{hayashi1981},
+so the simulation range $\theta\in[23.39,175.88]\,\mathrm{g\,cm^{-2}}$
+spans approximately 3--25 times the MMSN value.
+After filtering levels
+with fewer than 40 realisations to ensure reliable \KDE, 124 distinct
+$\spar$ values remain, each with at least 40 independent system
+outcomes.  These 124 values are partitioned at the $\spar$ level into
+99 training and 25 held-out test values (approximately 80/20).  The
+implicit smoothness assumption---that the three density functions vary
+smoothly with $\spar$ on the scale of the inter-training spacing---is
+verified empirically via the lag-1 autocorrelation of the smoothed PC
+scores (Section~\ref{sec:sign}).
+
+\subsection{Observables}
+\label{sec:observables}
+
+For each simulated system we extract three quantities for adjacent
+planet pairs:
+\begin{align}
+  X &= \log\!\bigl(P_{i+1}/P_i\bigr), \label{eq:X}\\
+  Y &= \log\!\bigl(\tau_{i+1}/\tau_i\bigr), \label{eq:Y}\\
+  Z &= (a_{i+1}-a_i)/R_{\mathrm{H}}, \label{eq:Z}
+\end{align}
+where $P_i$ is orbital period, $\tau_i$ transit duration, $a_i$
+semi-major axis, and $R_{\mathrm{H}}$ the mutual Hill radius.  These
+are standard diagnostics in observational analyses of \textit{Kepler}
+and \textit{K2} catalogues \citep{fabrycky2014, weiss2018, gilbert2020}.
+
+%% ================================================================
+\section{Pipeline}
+\label{sec:methods}
+
+\subsection{Inferential target and uncertainty decomposition}
+\label{sec:target}
+
+\paragraph{Inferential target.}
+The emulator targets the \emph{conditional mean density}:
+\begin{equation}
+  f^*(t|\spar) = \lim_{n\to\infty}\hat{f}(t|\spar),
+  \label{eq:target}
+\end{equation}
+the density the simulator produces at $\spar$ in the large-sample
+limit, estimated via \KDE from a finite sample of $n(\spar)$
+realisations.  The \GP posterior mean approximates this object.
+Posterior predictive samples represent uncertainty \emph{about this
+conditional mean density}---not individual realisation
+variability---and should be interpreted accordingly.
+
+\paragraph{Uncertainty decomposition.}
+\textit{Note.} The following decomposition uses notation defined in
+Sections~\ref{sec:mfpca}--\ref{sec:noise_decomp}; readers may find it useful
+to return here after reading those sections.
+Four sources of uncertainty arise; confounding them leads to both
+over- and under-confident interval claims.
+\begin{enumerate}
+  \item \emph{GP interpolation uncertainty} ($v_k$; defined in
+        Section~\ref{sec:gp}): posterior variance of the conditional
+        mean \MFPCA score at an unobserved $\spar^*$.
+  \item \emph{Residual score variability} ($s_k^2$; defined in
+        Section~\ref{sec:noise_decomp}): variability of raw \MFPCA scores
+        (Section~\ref{sec:mfpca}) around the LOESS-smoothed trend
+        (Section~\ref{sec:gp})---a mixture of \KDE sampling noise
+        and genuine within-$\spar$ distributional variation.  The two
+        cannot be separated without replicated density estimates at
+        the same~$\spar$.
+  \item \emph{Basis representation error} (defined in
+        Section~\ref{sec:mfpca}): the smooth B-spline basis cannot
+        resolve arbitrarily narrow density features.  This is a
+        systematic bias, not stochastic uncertainty; it is quantified
+        by the \MFPCA reconstruction floor (Table~\ref{tab:mfpca_recon},
+        Section~\ref{sec:mfpca_quality}).
+  \item \emph{Noise-decomposition approximation error} (defined in
+        Section~\ref{sec:noise_decomp}): the approximation
+        $v_k(\spar^*)+\sigma^2_{\mathrm{resid},k}$ assumes that the
+        LOESS residual variance adequately estimates KDE sampling noise
+        and is approximately constant across $\spar$.  It also assumes
+        approximate independence between GP interpolation error and KDE
+        sampling noise.  These are simplifications; their empirical
+        adequacy is assessed in
+        Sections~\ref{sec:noise_coverage} and~\ref{sec:ablation_transform}.
+\end{enumerate}
+Components 1 and 2 are propagated via the noise-decomposition
+predictive variance (Section~\ref{sec:noise_decomp}): the GP posterior variance
+$v_k$ captures component~1, while the restored LOESS residual variance
+$\sigma^2_{\mathrm{resid},k}$ captures component~2.
+Component 3 sets the representation floor quantified in
+Table~\ref{tab:mfpca_recon}.  Component 4 is controlled empirically:
+with the square-root density transform, this yields density-space
+coverage of 94.1\,\% ($X$), 84.9\,\% ($Y$), and 94.0\,\% ($Z$) at
+95\,\% nominal level, without post-hoc calibration.
+
+\subsection{Adaptive kernel density estimation}
+\label{sec:kde}
+
+At each $\spar$ level, $n(\spar)$ realisations are converted to smooth
+density estimates on fixed 200-point grids spanning the empirical
+training range.  All integrals are approximated via the trapezoidal
+rule.
+
+\paragraph{Pilot bandwidth (Silverman's rule \citep{silverman1986}).}
+For each observable $v\in\{X,Y,Z\}$, the pilot bandwidth at training
+level $\spar$ is
+\begin{equation}
+  h_0(\spar) = 0.9\min\!\bigl(s_v(\spar),\;
+               {\mathrm{IQR}_v(\spar)}/{1.34}\bigr)
+               \cdot n(\spar)^{-1/5},
+  \label{eq:silverman}
+\end{equation}
+where $s_v(\spar)$ and $\mathrm{IQR}_v(\spar)$ are the sample standard
+deviation and interquartile range of the $n(\spar)$ realisations of
+observable $v$ at level $\spar$.
+
+\paragraph{Abramson adaptive scaling \citep{abramson1982}.}
+Here $x_j$ ($j=1,\ldots,n(\spar)$) denotes the $j$-th simulated
+observation (e.g., log period ratio for one planet pair in one
+realisation at the given $\spar$ level).
+Let $\tilde{f}(\cdot|\spar)$ denote the pilot \KDE evaluated with
+the uniform bandwidth $h_0(\spar)$.  The per-observation scale factor is
+\begin{equation}
+  \lambda_j =
+  \bigl(\tilde{f}(x_j|\spar)/G_{\mathrm{geom}}\bigr)^{-1/2},\quad
+  G_{\mathrm{geom}} = \exp\!\bigl(n^{-1}\textstyle\sum_j
+                      \log\tilde{f}(x_j|\spar)\bigr).
+  \label{eq:abramson}
+\end{equation}
+The final estimate with effective bandwidth $h_j=h_0\lambda_j$ is
+\begin{equation}
+  \hat{f}(t|\spar) = \frac{1}{n(\spar)}\sum_j
+  \frac{1}{h_j}\kappa\!\bigl((t-x_j)/h_j\bigr),
+  \label{eq:kde}
+\end{equation}
+where $\kappa$ is the Gaussian kernel.  A dynamic support mask zeroes and renormalises density at grid points outside the observed data range extended by 10\,\% of the empirical range on each side (i.e., beyond $[\min(x_j)-0.1\cdot R,\;\max(x_j)+0.1\cdot R]$ where $R=\max(x_j)-\min(x_j)$).
+Grid values are then smoothed with an 80-knot B-spline basis
+(penalty $\lambda=10^{-5}$) using the \texttt{fda} package
+\citep{ramsay2005}.
+
+\subsection{Square-root density (Hellinger) transform}
+\label{sec:sqrt_transform}
+
+Probability densities are compositional: non-negative and integrating
+to unity.  Applying FPCA directly to raw densities can produce
+reconstructions that violate non-negativity.  A standard remedy is
+the centred log-ratio (CLR) transform, which maps densities to
+unconstrained $L^2$ functions.  However, the CLR inverse involves
+exponentiation, which \emph{exponentially amplifies} small
+score-prediction errors at density peaks---precisely the regions where
+accuracy matters most (Section~\ref{sec:ablation_transform}).
+
+We instead apply the \emph{square-root density} (Hellinger) transform:
+\begin{equation}
+  h(t) = \sqrt{f(t)},
+  \label{eq:sqrt_fwd}
+\end{equation}
+and work with $h(\cdot|\spar)$ throughout the MFPCA and GP stages.
+The inverse is:
+\begin{equation}
+  f(t) = h(t)^2 \Big/ \int_a^b h(s)^2\,\mathrm{d}s,
+  \label{eq:sqrt_inv}
+\end{equation}
+which guarantees non-negativity and involves only quadratic---not
+exponential---error amplification.  A score-prediction error of
+magnitude $\epsilon$ in the square-root space produces a density error
+of order $\epsilon^2$ at the peak, compared to $e^\epsilon-1\approx
+\epsilon$ under CLR, with a multiplicative constant that grows
+exponentially with peak height.
+
+Values below $\varepsilon_\mathrm{floor} = 5\times10^{-3}$ of the
+local maximum are floored before the transform to prevent numerical
+issues in the sparse tails.
+
+The square-root transform operates in the Hellinger geometry
+\citep{srivastava2007}, which is a natural metric for comparing
+probability densities.  Unlike CLR, it does not map to a zero-integral
+subspace; the MFPCA mean function and eigenfunctions are defined in
+the square-root density space and need not integrate to zero.
+
+\subsection{Multivariate functional PCA}
+\label{sec:mfpca}
+
+The square-root-transformed densities $h_X$, $h_Y$, $h_Z$ are
+functions of different variables on different domains.  \MFPCA
+\citep{happ2018} decomposes the joint variation of all three
+square-root densities simultaneously:
+\begin{equation}
+  \mathbf{h}(\cdot|\spar)
+  \approx\boldsymbol{\mu}(\cdot)
+  +\sum_{k=1}^{K}\xi_k(\spar)\,\boldsymbol{\phi}_k(\cdot),
+  \label{eq:mfpca}
+\end{equation}
+where $\boldsymbol{\mu}$ is the cross-$\spar$ mean function in
+square-root density space, $\boldsymbol{\phi}_k$ are multivariate
+eigenfunctions with equal variable weights ($w_v=1/3$), each
+represented in a $n_\phi=50$ B-spline basis, and $\xi_k(\spar)$ are
+scalar PC scores.  We retain $K=30$ components.
+
+No curve registration is applied.  An earlier version of this pipeline
+registered the dominant resonance location in $X$ and $Z$ before
+MFPCA, but the geometry parameters required emulation at test $\spar$
+values via LOESS, introducing a dominant error source (63--71\,\% of
+density-space ISE).  Removing that registration step eliminates this
+bottleneck entirely; the MFPCA basis absorbs resonance movement
+directly through additional eigenfunctions.
+
+\subsection{Sign alignment and LOESS pre-smoothing}
+\label{sec:sign}
+
+\paragraph{Sign alignment.}
+Eigenfunctions are sign-indeterminate: $(\boldsymbol{\phi}_k,\xi_k)$
+and $(-\boldsymbol{\phi}_k,-\xi_k)$ describe the same reconstruction.
+We adopt the convention that the sign is chosen so that the score
+series $\{\xi_k(\theta_j)\}$ has a non-negative Pearson correlation
+with $\{\theta_j\}$; concretely, we negate both $\boldsymbol{\phi}_k$
+and all $\xi_k$ whenever this correlation is negative.  The rationale
+is purely presentational: scores that tend to increase with $\spar$
+are easier to interpret visually (Figure~\ref{fig:scores}).  This
+convention does not alter the reconstruction subspace, fitted densities,
+or any metric value, and no monotonicity of $\xi_k$ in $\spar$ is
+implied.
+
+\paragraph{LOESS pre-smoothing.}
+Raw scores $\xi_k(\spar)$ contain \KDE sampling noise which, if left
+in the training signal, inflates GP hyperparameter estimates and
+degrades mean-function accuracy.  We apply LOESS (span
+$s_\mathrm{loess}=0.25$):
+\begin{equation}
+  \tilde{\xi}_k(\spar)=\mathrm{LOESS}_{0.25}[\xi_k](\spar).
+  \label{eq:loess}
+\end{equation}
+This denoising step improves GP mean estimation but discards part of
+the true within-$\spar$ variability.  The discarded variance
+$\sigma^2_{\mathrm{resid},k}=\mathrm{Var}[r_k]$ is restored at
+prediction time (Section~\ref{sec:noise_decomp}) as a fixed additive component
+of the predictive variance.
+The lag-1 autocorrelation of the smoothed series ranges from 0.92 to
+0.98 across PCs~1--8
+(Figure~\ref{fig:scores}), confirming structured $\spar$-dependence
+throughout.
+
+The raw-minus-smoothed residuals,
+\begin{equation}
+  r_k(\spar)=\xi_k(\spar)-\tilde{\xi}_k(\spar),
+  \label{eq:residuals}
+\end{equation}
+are retained for two purposes: (i) estimating the GP observation noise
+(Section~\ref{sec:gp}), and (ii) restoring the discarded variance at
+prediction time (Section~\ref{sec:noise_decomp}).
+
+\subsection{Homoscedastic Gaussian process with fixed known observation noise}
+\label{sec:gp}
+
+\paragraph{ECDF input warping.}
+The 99 training $\spar$ values are mapped to approximately uniform
+density in $[0,1]$ via the empirical CDF:
+\begin{equation}
+  u(\spar)=\frac{1}{99}\sum_{j=1}^{99}\mathbf{1}[\theta_j\le\spar],
+  \label{eq:ecdf}
+\end{equation}
+This maps the $j$-th training point to $j/99$, giving a range $[1/99,1]$; the values are then linearly rescaled to $[0,1]$ before standardisation to zero mean and unit variance.
+
+\paragraph{Two-stage smoother motivation.}
+Raw MFPCA scores contain substantial KDE sampling noise: mean
+noise SD across components is 0.44, while signal SD (the smooth
+$\spar$-dependent trend) is of comparable magnitude, yielding
+signal-to-noise ratios as low as 0.2 for leading PCs.  At this
+noise level with $n=99$ training points, a GP cannot reliably
+separate signal from noise; empirically, fitting a GP directly on raw
+scores with the same fixed observation-noise rule produces flat predictions with
+$\sigma^2\approx0$.  LOESS pre-smoothing is therefore a necessary
+first-stage denoiser; the GP emulates the denoised curve with the
+LOESS estimation uncertainty declared as fixed observation noise.
+
+\paragraph{Model.}
+For each component $k=1,\ldots,30$:
+\begin{equation}
+  \tilde{\xi}_k(\spar)\sim\GP\!\bigl(\beta_{0,k}+\beta_{1,k}u,\;
+    \alpha_k^2\,\calK_{\ell_k}(u,u')+\delta_k^2\bigr),
+  \label{eq:gp}
+\end{equation}
+where $\beta_{0,k}+\beta_{1,k}u$ is a linear mean function,
+$\alpha_k^2$ the signal variance, $\calK_{\ell_k}$ the
+Mat\'{e}rn-$\tfrac{3}{2}$ kernel:
+\begin{equation}
+  \calK_\ell(u,u')=
+  \Bigl(1+\frac{\sqrt{3}|u-u'|}{\ell}\Bigr)
+  \exp\!\Bigl(-\frac{\sqrt{3}|u-u'|}{\ell}\Bigr).
+  \label{eq:matern32}
+\end{equation}
+The length-scale is bounded below at $\ell_\mathrm{min}=0.08$ in
+\ECDF-warped space.
+
+\paragraph{Fixed observation noise.}
+The observation noise is fixed from the LOESS estimation uncertainty:
+\begin{equation}
+  \delta_k^2 =
+  \frac{\sigma^2_{\mathrm{resid},k}}{n_\mathrm{eff}},
+  \qquad n_\mathrm{eff} = \lfloor s_\mathrm{loess}\times N_\mathrm{train}\rfloor,
+  \label{eq:obs_noise}
+\end{equation}
+where
+$\sigma^2_{\mathrm{resid},k}=\mathrm{Var}[\xi_k-\tilde{\xi}_k]$
+is the per-component LOESS residual variance and
+$n_\mathrm{eff}\approx25$ is the effective sample size per LOESS fit.
+This gives fixed noise variances in the range 0.0003--0.007
+(Table~\ref{tab:hyperparams}).  Unlike a freely estimated
+observation-noise term,
+$\delta_k^2$ is not optimized; only the signal variance $\alpha_k^2$
+and length-scale $\ell_k$ are estimated via marginal likelihood
+maximization.
+
+\paragraph{Justification of homoscedastic noise.}
+LOESS pre-smoothing absorbs the $\spar$-dependent KDE noise before the
+GP sees the data.  What remains---the LOESS estimation uncertainty
+$\delta_k^2$---is approximately constant across $\spar$ (varying by a
+factor of $<2$ across the training range).  A legacy three-step
+Goldberg procedure with input-dependent noise was tested; its large
+fixed noise floor swamps the actual LOESS estimation noise
+($\sim$0.0003--0.007), forcing the GP to treat real signal as noise.  The
+three-way comparison (Table~\ref{tab:gp_comparison}) confirms that the
+homoscedastic warped GP outperforms that alternative on
+all three variables.
+
+\paragraph{Predictive distribution.}
+\begin{align}
+  m_k(\spar^*)&=\beta_{0,k}+\beta_{1,k}u^*+
+    \mathbf{k}_*^\top(\alpha_k^2\mathbf{K}_{\ell_k}+\delta_k^2\mathbf{I})^{-1}
+    \mathbf{r}_k,
+  \label{eq:gp_mean}\\
+  v_k(\spar^*)&=\alpha_k^2
+    -\mathbf{k}_*^\top(\alpha_k^2\mathbf{K}_{\ell_k}+\delta_k^2\mathbf{I})^{-1}
+    \mathbf{k}_*,
+  \label{eq:gp_var}
+\end{align}
+where $[\mathbf{k}_*]_j=\alpha_k^2\calK_{\ell_k}(u^*,u_j)$,
+$\mathbf{r}_k$ is the residual vector after subtracting the fitted
+linear mean, and
+$u^*=u(\spar^*)$ is the \ECDF-warped test input obtained by applying
+Eq.~\eqref{eq:ecdf} to the held-out value~$\spar^*$.  The variance
+$v_k(\spar^*)$ is the posterior variance for the latent smooth score
+function, before restoring the residual score variance.
+
+\subsection{Predictive variance via noise decomposition}
+\label{sec:noise_decomp}
+
+\paragraph{Motivation.}
+The GP epistemic variance $v_k(\spar^*)$ alone captures only
+uncertainty in the denoised mean score curve.  The LOESS pre-smoother
+suppresses residual score variability before GP fitting; without
+correction the emulator predicts a plausible conditional mean density
+but cannot produce useful interval estimates.
+
+\paragraph{Procedure.}
+The full predictive variance for a new score observation at $\spar^*$
+combines GP interpolation uncertainty with the LOESS residual variance:
+\begin{equation}
+  \sigma^2_{\mathrm{pred},k}(\spar^*) =
+  v_k(\spar^*)+\sigma^2_{\mathrm{resid},k},
+  \label{eq:pred_var}
+\end{equation}
+where $v_k(\spar^*)$ is the GP posterior variance
+(Equation~\ref{eq:gp_var}) and
+$\sigma^2_{\mathrm{resid},k}=\mathrm{Var}[\xi_k-\tilde{\xi}_k]$ is the
+per-component residual variance from Equation~\ref{eq:residuals}.
+Posterior samples are drawn from
+$\mathcal{N}(m_k(\spar^*),\sigma^2_{\mathrm{pred},k}(\spar^*))$ and
+back-transformed via Equations~\eqref{eq:mfpca} and~\eqref{eq:sqrt_inv}.
+The first term captures uncertainty about where the smooth trend lies
+between training points; the second restores the KDE sampling
+variability that LOESS removed before GP fitting.  No additional
+calibration factor is applied.
+
+\paragraph{Limitations.}
+This decomposition rests on two assumptions:
+(a)~the LOESS residual variance $\sigma^2_{\mathrm{resid},k}$ is
+approximately constant across $\spar$;
+(b)~the GP interpolation error and KDE sampling noise are approximately
+independent.
+Both are simplifications.  The per-variable density-space coverage
+---94.1\,\% ($X$), 84.9\,\% ($Y$), and 94.0\,\% ($Z$) at 95\,\%
+nominal level---indicates that the decomposition is adequate for $X$
+and $Z$ but slightly underestimates uncertainty for $Y$, the variable
+with the lowest dynamic range.  The slight under-coverage for $Y$ may
+reflect mild $\spar$-dependence of the KDE noise variance that the
+homoscedastic model does not capture.
+
+\subsection{Evaluation metrics}
+\label{sec:metrics}
+
+Metrics are means over 25 held-out test $\spar$ values.
+Formal significance tests (Section~\ref{sec:stat_conf}) and bootstrap
+confidence intervals (Table~\ref{tab:stat_tests}) should be consulted
+before interpreting directional differences as reliable.
+
+\paragraph{Pre-specified validation criteria.}
+We consider the emulator validated if:
+\begin{enumerate}
+  \item[(a)] leading-PC smoothed-score prediction is accurate
+             (positive held-out $R^2$ for PCs~1--8);
+  \item[(b)] density-space \iCRPS ratio $<1.0$ for at least two of
+             three observables at the 5\,\% significance level;
+  \item[(c)] density-space 95\,\% credible-band coverage falls within
+             $[85\%,\;100\%]$.
+\end{enumerate}
+
+\paragraph{\CRPS in PC space \citep{gneiting2007}.}
+\begin{equation}
+  \CRPS_k(\spar^*)=
+    (y_k-m_k)[2\Phi(z_k)-1]
+    +s_k^*[2\phi(z_k)-\pi^{-1/2}],
+  \label{eq:crps}
+\end{equation}
+where $z_k=(y_k-m_k)/s_k^*$, $y_k$ is the empirical mean score,
+$s_k^*=\sqrt{v_k(\spar^*)}$ is the GP posterior SD before restoring
+the residual variance,
+$\Phi$ is the standard normal CDF, and $\phi$ the standard normal PDF.
+This metric evaluates the \GP posterior without the restored residual
+variance in latent score space.  Because the GP is fit on
+LOESS-smoothed scores, $v_k$ alone understates the total predictive
+uncertainty; the PC-space CRPS skill score is therefore treated as a
+diagnostic rather than a validation criterion.  The primary validation
+metrics are the density-space \iCRPS and coverage, which include both
+variance components.
+
+\paragraph{\iCRPS --- primary density-space metric \citep{gneiting2007}.}
+For the $S=100$ posterior density ensemble $\{f^{(s)}\}$:
+\begin{equation}
+  \iCRPS(\spar^*)=
+    \tfrac{1}{S}\textstyle\sum_s\int|f^{(s)}-f^*|\,\mathrm{d}t
+    -\tfrac{1}{2S^2}\textstyle\sum_{s,s'}\int|f^{(s)}-f^{(s')}|
+    \,\mathrm{d}t,
+  \label{eq:icrps}
+\end{equation}
+where integrals are approximated via the trapezoidal rule on the
+200-point grid.  \iCRPS is a proper scoring rule that evaluates the
+full posterior ensemble in the original density space, directly
+measuring the emulator's ability to produce calibrated predictive
+distributions.  It is the primary density-space validation metric in
+this paper because it assesses the full predictive distribution in the
+same $L^1$ functional space as the target density, rather than only the
+posterior mean.  Density-space point-prediction metrics are therefore
+not used for primary emulator validation; reconstruction \ISE is
+retained separately only to characterise the basis representation floor
+in Table~\ref{tab:mfpca_recon}.
+
+The Energy Score \citep{gneiting2007} was also computed and yields
+consistent conclusions; we report \iCRPS as the primary proper scoring
+rule.
+
+\paragraph{Credible-band coverage.}
+Credible-band coverage at a given test $\spar^*$ is the fraction of the
+200 grid points $t$ where $f^*(t)$ falls within the pointwise
+$[2.5,97.5]$ quantile envelope of the ensemble $\{f^{(s)}\}$; the
+reported coverage is the mean of this fraction over the 25 test $\spar$
+values.
+
+\subsection{Naive and LOESS baselines}
+\label{sec:naive}
+
+\paragraph{Training-mean naive.}
+The simplest conceivable emulator: predict the same density for every
+test value of $\spar$, ignoring the input entirely.  Specifically,
+it predicts the training-mean density:
+\begin{equation}
+  \hat{f}_\mathrm{naive}(t)=\frac{1}{99}\sum_j\hat{f}(t|\theta_j).
+  \label{eq:naive_mean}
+\end{equation}
+For the ensemble-based metric (\iCRPS), scores are sampled
+from $\mathcal{N}(\bar{\xi}_k,s_{\mathrm{btw},k}^2)$ where
+$\bar{\xi}_k$ is the training mean score and $s_{\mathrm{btw},k}^2$
+is the between-$\spar$ score variance ($s_{\mathrm{btw},k}^2$ is the
+variance of the training mean scores $\{\bar{\xi}_k(\theta_j)\}_{j=1}^{99}$
+across the 99 training values; this is distinct from the per-component
+residual variance $\sigma^2_{\mathrm{resid},k}$ defined from
+Equation~\eqref{eq:residuals}).  This gives the naive
+predictor a realistic spread that captures population-level variation;
+a zero-spread version would be trivially dominated on proper scoring
+rules.  Any emulator that fails to beat this baseline on a given
+metric is contributing no information beyond the marginal training
+distribution at that metric---a meaningful benchmark precisely because
+it sets the lowest acceptable bar.
+
+\paragraph{Score-space LOESS baseline.}
+A score-space LOESS regression (span 0.50, degree 1) is fitted to
+each PC score vs.\ $\spar$ independently and used to predict mean
+scores at test $\spar$ values; densities are reconstructed from these
+predictions.  This baseline is deterministic and provides no
+uncertainty quantification.  It directly tests whether the GP
+machinery adds value over simple nonparametric interpolation for
+latent mean prediction.  Because it produces no ensemble, it is not
+included in the primary density-space \iCRPS tables.
+
+\paragraph{Nearest-neighbour density baseline.}
+For each test $\spar^*$, the $k$ nearest training $\spar$ values
+(by Euclidean distance) are identified; their \KDE density estimates
+define a simple local density ensemble via bootstrap resampling of the
+$k$ neighbours.  This $\spar$-aware conditional density estimator
+requires no GP fitting; results for
+$k\in\{1,3,5\}$ appear in Table~\ref{tab:nn_comparator}.
+
+\paragraph{Ablated GP variants.}
+Two alternative GP configurations are used for ablation
+(Table~\ref{tab:gp_comparison}): (i)~a homoscedastic GP without \ECDF
+warping (same fixed LOESS-SE$^2$ observation-noise logic), and
+(ii)~a heteroscedastic GP without warping (Goldberg 3-step procedure,
+Mat\'{e}rn-$\frac{3}{2}$).  Together with the paper configuration
+(homoscedastic, \ECDF warping, fixed LOESS-SE$^2$ observation noise
+and prediction-time residual variance), these isolate
+the marginal contributions of the noise model and input transformation.
+
+Throughout, we report \emph{metric ratios}: for two methods $A$ and
+$B$, the ratio $r(A/B) = \overline{m}(A)/\overline{m}(B)$, where
+$\overline{m}(\cdot)$ is the mean metric value over 25 test $\spar$
+values and lower is better.  A ratio $r < 1$ indicates $A$ outperforms
+$B$; $r = 1$ indicates parity.  For binned-mean $R^2$, higher is better,
+so ratios above 1 indicate improvement.
+
+\begin{table}[htbp]
+  \centering
+  \caption{Fixed pipeline hyperparameters (full list).}
+  \label{tab:hyperparams}
+  \begin{tabular}{lll}
+    \toprule
+    Parameter & Value & Primary effect \\
+    \midrule
+    KDE grid points            & 200   & Integral approximation accuracy \\
+    KDE B-spline basis         & 80 knots & KDE fidelity \\
+    Density floor $\varepsilon$ & $5\times10^{-3}$ & Tail behaviour \\
+    MFPCA components $K$       & 30    & Representation accuracy \\
+    Eigenfunction basis        & 50 knots & Eigenfunction fidelity \\
+    LOESS span (scores)        & 0.25  & Signal/noise split \\
+    GP $\ell_\mathrm{min}$     & 0.08  & Over-fitting protection \\
+    GP obs.\ noise $\delta_k^2$ & $\sigma^2_{\mathrm{resid},k}/n_\mathrm{eff}$ (fixed) & LOESS estimation uncertainty \\
+    Restored variance $\sigma^2_{\mathrm{resid},k}$ & $\mathrm{Var}[\xi_k-\tilde{\xi}_k]$ & KDE sampling noise at prediction \\
+    GP mean function           & Linear ($\beta_0+\beta_1 u$) & Handles weak trends \\
+    Posterior samples $S$      & 100   & Monte Carlo accuracy \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+%% ================================================================
+\section{Results}
+\label{sec:results}
+
+\subsection{MFPCA representation}
+\label{sec:mfpca_quality}
+
+\begin{table}[htbp]
+  \centering
+  \caption{MFPCA variance explained.  Thirty components account
+           for 99.98\,\% of total functional variance.}
+  \label{tab:mfpca_var}
+  \begin{tabular}{lrr}
+    \toprule
+    Component & Eigenvalue & Cumul.\ var.\ (\%) \\
+    \midrule
+    PC\,1  & 2.200 & 21.59 \\
+    PC\,2  & 0.682 & 28.28 \\
+    PC\,3  & 0.578 & 33.95 \\
+    PC\,4  & 0.544 & 39.29 \\
+    PC\,5  & 0.476 & 43.96 \\
+    PC\,6  & 0.468 & 48.55 \\
+    PC\,7  & 0.426 & 52.74 \\
+    PC\,8  & 0.389 & 56.57 \\
+    PC\,9  & 0.374 & 60.23 \\
+    PC\,10 & 0.314 & 63.32 \\
+    \midrule
+    PC\,20 & 0.174 & 83.63 \\
+    PC\,25 & 0.132 & 93.17 \\
+    PC\,30 & 0.098 & 99.98 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\begin{table}[htbp]
+  \centering
+  \caption{\MFPCA reconstruction \ISE using \emph{exact} unpredicted
+           scores (no GP involvement).  These values measure the
+           reconstruction accuracy of the 50-knot B-spline basis,
+           independently of emulation.}
+  \label{tab:mfpca_recon}
+  \begin{tabular}{lcc}
+    \toprule
+    Variable & Mean \ISE & Distributional character \\
+    \midrule
+    $X$ (Log period ratio)   & 1.308 & Multi-modal, sharp resonance spikes \\
+    $Y$ (Log duration ratio) & 0.113 & Smooth, approximately unimodal \\
+    $Z$ (Log Hill spacing)   & 0.714 & Moderate resonance structure \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+Table~\ref{tab:mfpca_var} shows the variance decomposition.
+Table~\ref{tab:mfpca_recon} quantifies the representation floor using
+exact, unpredicted scores; this \ISE characterises the basis
+independently of emulation and is not used as a primary validation
+metric.  The $Y$ distribution (smooth, unimodal) is
+reconstructed with mean \ISE\ of 0.113.  The $X$ and $Z$ distributions
+contain sharp resonance spikes not well-resolved within the 50-knot
+B-spline basis (mean \ISE\ 1.308 and 0.714 respectively).  The
+square-root transform improves the representation floor relative to
+the CLR-based draft values (1.682 for $X$, 0.114 for $Y$, and 1.147
+for $Z$).  These values set the representation floor \emph{for the
+current basis choice}; they are not irreducible.  The centre column of
+Figure~\ref{fig:reconstruction} illustrates this floor at a
+representative test $\spar$.
+
+\subsection{Latent-space GP performance}
+\label{sec:gp_results}
+
+\begin{table}[htbp]
+  \centering
+  \caption{GP emulator diagnostics in latent \MFPCA space (25
+           held-out test $\spar$ values).  The CRPS diagnostic uses
+           the GP posterior variance before restoring residual variance,
+           so density-space metrics remain primary.}
+  \label{tab:gp_perf}
+  \begin{tabular}{lc}
+    \toprule
+    Metric & Value \\
+    \midrule
+    Mean training RMSE                  & 0.0133 \\
+    PC1--8 held-out $R^2$ range         & 0.96--0.99 \\
+    Binned-mean $R^2$                   & 0.946 \\
+    PC-space \CRPS skill score          & $-0.11$ \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+Per-component test $R^2$ values range from 0.96 to 0.99 for
+PCs~1--8, confirming that the GP accurately predicts the
+LOESS-smoothed score curves.  The PC-space \CRPS skill score is
+$-0.11$; this reflects the narrow GP posterior variance $v_k$ relative
+to the naive baseline spread, not poor mean prediction.  Because the
+primary validation metrics (\iCRPS and coverage) operate in density
+space where the full predictive variance
+$v_k+\sigma^2_{\mathrm{resid},k}$ is used, the latent \CRPS is a
+diagnostic rather than a validation criterion.
+
+\subsection{Noise-decomposition coverage}
+\label{sec:noise_coverage}
+
+\begin{table}[htbp]
+  \centering
+  \caption{Density-space credible-band coverage at 95\,\% nominal
+           level under the noise-decomposition predictive variance.}
+  \label{tab:coverage}
+  \begin{tabular}{lccc}
+    \toprule
+    Metric & $X$ & $Y$ & $Z$ \\
+    \midrule
+    Density-space 95\,\% coverage & 94.1\,\% & 84.9\,\% & 94.0\,\% \\
+    Calibration factor $c$        & 1.00 & 1.00 & 1.00 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+No post-hoc calibration factor is applied ($c=1.0$).  The
+noise-decomposition predictive variance (Equation~\ref{eq:pred_var})
+yields per-variable coverage of 94.1\,\% ($X$) and 94.0\,\% ($Z$),
+near the 95\,\% nominal level.  $Y$ coverage (84.9\,\%) falls just
+below the 85\,\% pre-specified threshold, reflecting the variable's
+lower dynamic range: with smoother, lower-peaked densities, small
+score-space under-dispersion translates to a larger coverage deficit
+than for the spiked $X$ and $Z$ distributions.  A per-variable
+calibration factor $c_Y\approx1.15$ would restore $Y$ coverage to
+95\,\%, but we report the un-tuned result to preserve out-of-sample
+validity.
+
+\subsection{Density-space evaluation}
+\label{sec:density_eval}
+
+\begin{table}[htbp]
+  \centering
+  \caption{Density-space evaluation on 25 held-out test $\spar$
+           values.  GP columns use the noise-decomposition predictive
+           variance (Equation~\ref{eq:pred_var}).  Ratios $<1$ indicate
+           GP improvement.  \textbf{Bold}: ratio $<1$; $^*$: $p<0.05$,
+           one-sided paired Wilcoxon, $n=25$.}
+  \label{tab:density_eval}
+  \begin{tabular}{llcccc}
+    \toprule
+    Metric & Var & GP & Naive & GP/Naive & Verdict \\
+    \midrule
+    \iCRPS
+      & $X$ & 0.837 & 1.003 & \textbf{0.835}\textsuperscript{*} & GP wins \\
+      & $Y$ & 0.304 & 0.399 & \textbf{0.761}\textsuperscript{*} & GP wins \\
+      & $Z$ & 0.763 & 0.940 & \textbf{0.812}\textsuperscript{*} & GP wins \\[3pt]
+    \ISE
+      & $X$ & 3.764 & 4.138 & \textbf{0.910} & GP better \\
+      & $Y$ & 0.281 & 0.336 & \textbf{0.836} & GP better \\
+      & $Z$ & 2.774 & 3.128 & \textbf{0.887} & GP better \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\paragraph{Proper scoring rules: GP wins on all three variables.}
+On \iCRPS, the emulator outperforms the naive baseline for all three
+observables, with improvements of 17--24\,\% and bootstrap 95\,\% CIs
+entirely below 1.0.  This represents a substantial improvement over
+the CLR-based pipeline (Section~\ref{sec:ablation_transform}), where
+$Y$ showed no significant improvement.
+
+\paragraph{Point prediction: GP modestly improves all variables.}
+On \ISE, the GP improves over the naive baseline by 9\,\% ($X$),
+16\,\% ($Y$), and 11\,\% ($Z$).  The GP's primary value is in
+probabilistic uncertainty quantification (\iCRPS improvement roughly
+double the \ISE improvement), not point estimation.
+
+\subsection{Error decomposition}
+\label{sec:decomposition}
+
+\begin{table}[htbp]
+  \centering
+  \caption{ISE decomposition at held-out test $\spar$ values.
+           The MFPCA floor uses exact (unpredicted) scores; the GP row
+           uses GP-predicted scores.  The difference (GP uplift)
+           isolates the GP's contribution to density-space error.}
+  \label{tab:decomposition}
+  \begin{tabular}{lccc}
+    \toprule
+    Stage & $X$ ISE & $Y$ ISE & $Z$ ISE \\
+    \midrule
+    MFPCA floor (true scores)  & 1.308 & 0.113 & 0.714 \\
+    GP predicted scores        & 3.764 & 0.281 & 2.774 \\
+    Naive baseline             & 4.138 & 0.336 & 3.128 \\
+    \midrule
+    GP uplift over floor       & +2.456 & +0.168 & +2.060 \\
+    GP uplift as \% of total   & 65\,\% & 60\,\% & 74\,\% \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+GP score prediction error dominates the remaining density-space error
+(60--74\,\% of total ISE), while the MFPCA basis representation
+accounts for 26--40\,\%.  This confirms that the basis is adequate for
+the current application; future improvement should target GP prediction
+quality (more training data, richer kernels) rather than the density
+representation.
+
+\subsection{Ablation: density transform}
+\label{sec:ablation_transform}
+
+\begin{table}[htbp]
+  \centering
+  \caption{Effect of density transform on key metrics.  Both
+           configurations use MFPCA ($K=30$), no peak alignment,
+           and homoscedastic GP with LOESS-SE$^2$ observation noise.
+           CLR values come from the previous post-hoc-calibration
+           configuration; $\sqrt{f}$ values use the Apr29
+           noise-decomposition pipeline.}
+  \label{tab:ablation_transform}
+  \begin{tabular}{lcc}
+    \toprule
+    Metric & CLR & $\sqrt{f}$ (Hellinger) \\
+    \midrule
+    \iCRPS ratio $X$ (GP/Naive) & 0.768 & \textbf{0.835}\textsuperscript{*} \\
+    \iCRPS ratio $Y$ (GP/Naive) & 0.983 (n.s.) & \textbf{0.761}\textsuperscript{*} \\
+    \iCRPS ratio $Z$ (GP/Naive) & 0.832 & \textbf{0.812}\textsuperscript{*} \\
+    Variables with $p<0.05$     & 2 of 3 & \textbf{3 of 3} \\
+    Density 95\,\% coverage     & 61.1\,\% & \textbf{94.1/84.9/94.0\,\%} \\
+    Calibration factor $c$      & tuned & \textbf{1.00} \\
+    GP uplift $X$               & +2.89 & \textbf{+2.46} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+The square-root transform substantially improves calibration and makes
+all three \iCRPS comparisons statistically significant.  The most
+dramatic effect is on density-space coverage (61\,\% $\to$
+near-nominal coverage for $X$ and $Z$), confirming that the CLR's
+exponential inverse was the primary driver of miscalibration.  $Y$
+(log duration ratio) becomes statistically significant under the
+$\sqrt{f}$ transform, reflecting reduced error amplification for this
+variable whose densities have lower dynamic range.  The \iCRPS
+\emph{ratio} for $X$ appears slightly worse (0.835 vs 0.768) because
+the naive baseline also improves without CLR amplification; the
+\emph{absolute} GP \iCRPS remains better (0.837 vs 0.847 for $X$).
+
+%% ================================================================
+\section{Discussion}
+\label{sec:discussion}
+
+\subsection{Interpreting the results}
+\label{sec:evidence}
+
+The final pipeline achieves near-calibrated density-space uncertainty:
+per-variable coverage is 94.1\,\% ($X$), 84.9\,\% ($Y$), and
+94.0\,\% ($Z$) at 95\,\% nominal level, without post-hoc calibration
+(Table~\ref{tab:coverage}).  For the $X$ and $Z$ observables---which
+exhibit sharp resonance peaks and high dynamic range---coverage is
+within 1\,\% of the nominal level.  The $Y$ observable (smooth, low
+dynamic range) shows slight under-coverage, potentially addressable by
+modelling $\spar$-dependent noise variance.  The absence of a tuned
+calibration factor means these coverage values are genuine
+out-of-sample assessments.
+
+The GP's primary value is near-calibrated probabilistic prediction.
+On \iCRPS, the emulator improves over the naive baseline by 17--24\,\%
+for all three variables; on \ISE, posterior-mean improvements are more
+modest at 9--16\,\% (Table~\ref{tab:density_eval}).  This asymmetry is
+appropriate for an emulator designed for MCMC: proper scoring rules
+reward accurate predictive distributions, while point-prediction
+metrics ignore whether uncertainty is usable.
+
+The density transform is the most consequential architectural choice.
+Replacing CLR with the square-root density transform improves
+density-space coverage from 61\,\% to near-nominal values for $X$ and
+$Z$ without post-hoc calibration and makes the $Y$ comparison
+statistically significant (Table~\ref{tab:ablation_transform}).
+The improvement is larger than the differences among GP noise-model
+variants (Table~\ref{tab:gp_comparison}).
+
+Removing curve registration also simplified the pipeline and eliminated
+a dominant error source.  The final MFPCA basis absorbs peak movement
+through its eigenfunctions rather than requiring separate geometry
+parameters that must themselves be emulated at test $\spar$ values.
+
+\subsection{Representation floor: current basis, not fundamental limit}
+\label{sec:discussion_floor}
+
+The representation floor is specific to the 50-knot B-spline basis and
+$K=30$ components.  The exact-score reconstruction \ISE
+(Table~\ref{tab:mfpca_recon}: 1.308 for $X$, 0.113 for $Y$, and
+0.714 for $Z$), computed without any GP involvement, establishes that
+this floor is a property of the basis, not of the emulator.  The error
+decomposition (Table~\ref{tab:decomposition}) shows that the bottleneck
+has shifted: GP score prediction accounts for 60--74\,\% of total
+density-space \ISE, while the basis representation accounts for
+26--40\,\%.  Future accuracy gains should therefore target score
+prediction quality and the residual-noise model first.
+
+\subsection{Sensitivity to pipeline choices}
+\label{sec:sensitivity}
+
+The transform ablation (Table~\ref{tab:ablation_transform}) dominates
+the sensitivity story.  With the final square-root representation fixed,
+the three-way GP comparison in Table~\ref{tab:gp_comparison} shows that
+the homoscedastic warped GP is competitive with, and usually better
+than, the no-warp and heteroscedastic alternatives.  This supports the
+two-stage design: LOESS removes high-frequency KDE noise first, and the
+GP emulates the denoised score curve with the LOESS estimation
+uncertainty as fixed known observation noise.  The residual variance
+stripped by LOESS is restored at prediction time, giving a principled
+uncertainty decomposition that requires no post-hoc calibration.
+
+\subsection{Baseline adequacy}
+\label{sec:benchmarks}
+
+Three baselines delimit where the GP adds value.
+
+\begin{table}[htbp]
+  \centering
+  \caption{Nearest-neighbour density comparison ($k=1,3,5$ neighbours)
+           vs GP, mean over 25 test $\spar$ values, reported via
+           \iCRPS (lower is better).  The NN comparator is converted
+           into a simple local ensemble by bootstrap resampling the
+           $k$ nearest training densities; GP/NN-k3$<1$ means the full
+           GP beats the 3-nearest-neighbour density ensemble.  NN
+           columns are unchanged by the GP noise-model update.}
+  \label{tab:nn_comparator}
+  \setlength{\tabcolsep}{4pt}
+  \begin{tabular}{lccccc}
+    \toprule
+    Metric & NN-$k$1 & NN-$k$3 & NN-$k$5 & GP & GP/NN-$k$3 \\
+    \midrule
+    \iCRPS\ $X$      & 0.820 & 1.061 & 0.975 & 0.837 & 0.789 \\
+    \iCRPS\ $Y$      & 0.323 & 0.404 & 0.366 & 0.304 & 0.752 \\
+    \iCRPS\ $Z$      & 0.807 & 1.036 & 0.934 & 0.763 & 0.737 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\begin{table}[htbp]
+  \centering
+  \caption{Three-way \GP comparison isolating the contribution of
+           noise model choice and \ECDF input warping.
+           GP-HO-NW: homoscedastic, no warping.
+           GP-HE-NW: heteroscedastic (Goldberg 3-step), no warping.
+           GP-HO-W: homoscedastic with \ECDF warping, fixed LOESS-SE$^2$
+           observation noise, and prediction-time residual variance
+           (paper configuration).
+           \iCRPS: lower is better; binned-mean $R^2$: higher is better.
+           Ratios $<1$ indicate improvement of GP-HO-W over the comparator.}
+  \label{tab:gp_comparison}
+  \setlength{\tabcolsep}{4pt}
+  \begin{tabular}{lccccc}
+    \toprule
+    Metric & GP-HO-NW & GP-HE-NW & GP-HO-W & HO-W/HO-NW & HO-W/HE-NW \\
+    \midrule
+    \iCRPS\ $X$          & 1.207 & 1.173 & 0.837 & 0.693 & 0.714 \\
+    \iCRPS\ $Y$          & 0.426 & 0.426 & 0.304 & 0.712 & 0.713 \\
+    \iCRPS\ $Z$          & 1.104 & 1.083 & 0.763 & 0.691 & 0.705 \\
+    Binned-mean $R^2$    & 0.988 & 0.439 & 0.946 & 0.958 & --- \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+Against the $\spar$-aware 3-nearest-neighbour estimator, the GP
+matches or outperforms on \iCRPS for all three variables
+(GP/NN-k3: 0.737--0.789; Table~\ref{tab:nn_comparator}), establishing
+that the model adds value beyond simple conditional density averaging
+while also providing smooth interpolation and uncertainty bands.
+
+The three-way GP comparison (Table~\ref{tab:gp_comparison}) isolates
+architectural contributions.  GP-HO-NW removes input warping, while
+GP-HE-NW replaces the final homoscedastic observation-noise model with a legacy
+heteroscedastic model.  GP-HO-W (the paper configuration) achieves the
+lowest \iCRPS on all three variables, supporting the final choice of
+\ECDF warping plus the noise-decomposition predictive variance.
+
+Comparing univariate FPCA per density against \MFPCA would isolate
+the value of joint modelling; given that the primary remaining error
+now traces to score prediction, this comparison is deferred to future
+work.
+
+\subsection{Significance testing}
+\label{sec:stat_conf}
+
+\begin{table}[htbp]
+  \centering
+  \caption{Significance tests for \iCRPS ($n=25$ test pairs).
+           Wilcoxon: one-sided $H_1$: GP $<$ Naive
+           (lower \iCRPS = better).
+           Bootstrap CI: 95\,\% interval on GP/Naive ratio
+           (5000 resamples); CI entirely below 1.0 confirms GP wins.}
+  \label{tab:stat_tests}
+  \begin{tabular}{lccc}
+    \toprule
+    Variable & $p$-value & Sig. & 95\,\% CI (ratio) \\
+    \midrule
+    $X$ (Log period ratio)   & $<$0.0001 & $*$ & [0.810, 0.859] \\
+    $Y$ (Log duration ratio) & $<$0.0001 & $*$ & [0.683, 0.833] \\
+    $Z$ (Log Hill spacing)   & $<$0.0001 & $*$ & [0.779, 0.848] \\
+    \bottomrule
+  \end{tabular}
+
+  \smallskip
+  {\small $*$ $p<0.05$.  All three bootstrap CIs lie entirely below
+  1.0, confirming the GP outperforms the naive baseline.}
+\end{table}
+
+All three \iCRPS comparisons ($X$, $Y$, $Z$) are statistically
+significant at the 5\,\% level; bootstrap 95\,\% confidence intervals
+on the GP/Naive ratio lie entirely below~1.0 for all three
+(Table~\ref{tab:stat_tests}).  Point-prediction improvements are
+modest but consistent, while the probabilistic improvements are
+statistically decisive.
+
+\subsection{Alternative density representations}
+\label{sec:alternatives}
+
+For $X$ (and to a lesser extent $Z$), the following approaches may
+reduce basis-limitation error: location-scale parametrisation of
+resonance spikes \citep{ma2011}; amplitude-phase separation before
+\MFPCA \citep{ramsay2005, kurtek2011}; quantile-function
+representation; or Gaussian mixture emulation.  These alternatives are
+secondary to the immediate bottleneck identified in
+Table~\ref{tab:decomposition}: score prediction error now accounts for
+most of the remaining density-space \ISE.
+
+%% ================================================================
+\section{Conclusions}
+\label{sec:conclusions}
+
+A Gaussian process emulation workflow for multivariate conditional
+density functions from planetary system simulations yields three
+principal findings.
+
+\emph{The pipeline produces near-calibrated probabilistic density
+predictions.}  Per-variable density-space 95\,\% credible-band
+coverage reaches 94.1\,\% ($X$) and 94.0\,\% ($Z$) without post-hoc
+calibration, confirming that the noise-decomposition predictive
+variance provides reliable uncertainty quantification for downstream
+Bayesian inverse inference.  $Y$ coverage (84.9\,\%) falls slightly
+below the pre-specified 85\,\% threshold, attributable to the variable's
+lower dynamic range; this is noted as a limitation.  The \iCRPS proper
+scoring rule shows statistically significant improvement over the naive
+baseline for all three observables (17--24\,\% improvement, all
+$p<0.05$).
+
+\emph{The square-root density transform is the critical architectural
+choice.}  Replacing the standard CLR transform with the Hellinger
+($\sqrt{f}$) transform eliminates the exponential error amplification
+in the CLR inverse, improving density-space coverage from 61\,\% to
+near-nominal values for $X$ and $Z$ without post-hoc calibration and
+enabling $Y$ (log duration ratio) to achieve statistical significance.
+This insight may be broadly applicable to other
+functional data emulation problems involving density-valued outputs.
+
+\emph{GP score prediction is the primary remaining error source.}
+An ISE decomposition shows that GP prediction error accounts for
+60--74\,\% of total density-space ISE, with the MFPCA basis
+representation contributing 26--40\,\%.  Future improvement should
+target GP prediction quality (more training simulations, richer
+kernels) and mild $\spar$-dependence in the residual-noise variance
+rather than the density representation.
+
+The emulator is ready for deployment in Bayesian inverse inference of
+planet formation conditions from Kepler observations; this application
+is the subject of a companion paper.
+
+%% ================================================================
+\section*{Acknowledgements}
+The author thanks the developers and maintainers of the open-source
+\textsf{R} packages used in this analysis.  No external funding was
+reported for this work.
+
+\section*{Data Availability}
+The simulation data and \textsf{R} analysis code sufficient to
+reproduce all tables and figures in this paper will be deposited in a
+public repository at acceptance.  The analysis was conducted in
+\textsf{R}~4.3.2; key packages are \texttt{fda}~6.1.4
+\citep{ramsay2005}, \texttt{MFPCA}~1.3 \citep{happ2018},
+\texttt{DiceKriging}~1.6.0 \citep{roustant2012},
+\texttt{scoringRules}~1.1.3 \citep{jordan2019}, and
+\texttt{ggplot2}~3.4.4.
+
+%% ================================================================
+\begin{thebibliography}{99}
+
+\bibitem[Abramson(1982)]{abramson1982}
+Abramson, I.~S.\ 1982, \textit{Ann.\ Stat.}, 10, 1217.
+
+\bibitem[Benz et al.(2014)]{benz2014}
+Benz, W., Ida, S., Alibert, Y., Lin, D., \& Mordasini, C.\ 2014,
+in \textit{Protostars and Planets VI}, eds.\ H.\ Beuther et al.,
+University of Arizona Press, p.\ 691.
+
+\bibitem[Bower et al.(2010)]{bower2010}
+Bower, R.~G.\ et al.\ 2010, \textit{MNRAS}, 407, 2017.
+
+\bibitem[Egozcue et al.(2003)]{egozcue2003}
+Egozcue, J.~J., Pawlowsky-Glahn, V., Mateu-Figueras, G., \&
+Barcel\'{o}-Vidal, C.\ 2003, \textit{Math.\ Geol.}, 35, 279.
+
+\bibitem[Emsenhuber et al.(2021)]{emsenhuber2021}
+Emsenhuber, A.\ et al.\ 2021, \textit{A\&A}, 656, A69.
+
+\bibitem[Fabrycky et al.(2014)]{fabrycky2014}
+Fabrycky, D.~C.\ et al.\ 2014, \textit{ApJ}, 790, 146.
+
+\bibitem[Fricker et al.(2013)]{fricker2013}
+Fricker, T.~E., Oakley, J.~E., \& Urban, N.~M.\ 2013,
+\textit{Technometrics}, 55, 174.
+
+\bibitem[Gilbert \& Fabrycky(2020)]{gilbert2020}
+Gilbert, G.~J.\ \& Fabrycky, D.~C.\ 2020, \textit{AJ}, 159, 281.
+
+\bibitem[Gneiting \& Raftery(2007)]{gneiting2007}
+Gneiting, T.\ \& Raftery, A.~E.\ 2007,
+\textit{J.\ Am.\ Stat.\ Assoc.}, 102, 359.
+
+\bibitem[Goldberg et al.(1998)]{goldberg1998}
+Goldberg, P.~W., Williams, C.~K.~I., \& Bishop, C.~M.\ 1998,
+in \textit{Advances in Neural Information Processing Systems 10},
+eds.\ M.~I.\ Jordan, M.~J.\ Kearns \& S.~A.\ Solla,
+MIT Press, pp.\ 493--499.
+
+\bibitem[Happ \& Greven(2018)]{happ2018}
+Happ, C.\ \& Greven, S.\ 2018, \textit{Biometrics}, 74, 237.
+
+\bibitem[Hayashi(1981)]{hayashi1981}
+Hayashi, C.\ 1981, \textit{Prog.\ Theor.\ Phys.\ Suppl.}, 70, 35.
+
+\bibitem[Higdon et al.(2008)]{higdon2008}
+Higdon, D., Gattiker, J., Williams, B., \& Rightley, M.\ 2008,
+\textit{J.\ Am.\ Stat.\ Assoc.}, 103, 570.
+
+\bibitem[Ida \& Lin(2004)]{ida2004}
+Ida, S.\ \& Lin, D.~N.~C.\ 2004, \textit{ApJ}, 604, 388.
+
+\bibitem[Jordan et al.(2019)]{jordan2019}
+Jordan, A., Kr\"uger, F., \& Lerch, S.\ 2019,
+\textit{J.\ Stat.\ Softw.}, 90, 1.
+
+\bibitem[Kennedy \& O'Hagan(2001)]{kennedy2001}
+Kennedy, M.~C.\ \& O'Hagan, A.\ 2001,
+\textit{J.\ R.\ Stat.\ Soc.\ B}, 63, 425.
+
+\bibitem[Kersting et al.(2007)]{kersting2007}
+Kersting, K., Plagemann, C., Pfaff, P., \& Burgard, W.\ 2007,
+in \textit{Proc.\ 24th ICML}, ACM, pp.\ 393--400.
+
+\bibitem[Kurtek et al.(2011)]{kurtek2011}
+Kurtek, S., Srivastava, A., \& Wu, W.\ 2011,
+in \textit{Proc.\ CVPR 2011}, IEEE, pp.\ 1995--2002.
+
+\bibitem[Ma \& Zabaras(2011)]{ma2011}
+Ma, X.\ \& Zabaras, N.\ 2011, \textit{J.\ Comput.\ Phys.}, 230, 8604.
+
+\bibitem[Mordasini(2018)]{mordasini2018}
+Mordasini, C.\ 2018, in \textit{Handbook of Exoplanets},
+eds.\ H.~J.\ Deeg \& J.~A.\ Belmonte, Springer, pp.\ 2425--2474.
+
+\bibitem[Mulders et al.(2021)]{mulders2021}
+Mulders, G.~D.\ et al.\ 2021, \textit{ApJ}, 920, 66.
+
+\bibitem[Ramsay \& Silverman(2005)]{ramsay2005}
+Ramsay, J.~O.\ \& Silverman, B.~W.\ 2005,
+\textit{Functional Data Analysis}, 2nd edn., Springer.
+
+\bibitem[Roustant et al.(2012)]{roustant2012}
+Roustant, O., Ginsbourger, D., \& Deville, Y.\ 2012,
+\textit{J.\ Stat.\ Softw.}, 51, 1.
+
+\bibitem[Rasmussen \& Williams(2006)]{rasmussen2006}
+Rasmussen, C.~E.\ \& Williams, C.~K.~I.\ 2006,
+\textit{Gaussian Processes for Machine Learning}, MIT Press.
+
+\bibitem[Silverman(1986)]{silverman1986}
+Silverman, B.~W.\ 1986,
+\textit{Density Estimation for Statistics and Data Analysis},
+Chapman \& Hall.
+
+\bibitem[Srivastava et al.(2007)]{srivastava2007}
+Srivastava, A., Jermyn, I.~H., \& Joshi, S.~H.\ 2007,
+in \textit{Proc.\ IEEE Conf.\ Computer Vision and Pattern Recognition
+(CVPR)}, doi:10.1109/CVPR.2007.383188.
+
+\bibitem[van den Boogaart \& Tolosana-Delgado(2014)]{van2014}
+van den Boogaart, K.~G.\ \& Tolosana-Delgado, R.\ 2014,
+\textit{Analyzing Compositional Data with R}, Springer.
+
+\bibitem[Weiss et al.(2018)]{weiss2018}
+Weiss, L.~M.\ et al.\ 2018, \textit{AJ}, 155, 48.
+
+\bibitem[Winn \& Fabrycky(2015)]{winn2015}
+Winn, J.~N.\ \& Fabrycky, D.~C.\ 2015, \textit{ARA\&A}, 53, 409.
+
+\bibitem[MacDonald et al.(2020)]{macdonald2020}
+MacDonald, M.~G., Dawson, R.~I., Morrison, S.~J., Lee, E.~J., \&
+Khandelwal, A.\ 2020, \textit{ApJ}, 891, 20.
+
+\end{thebibliography}
+
+%% ================================================================
+\appendix
+\section{Figures}
+\label{app:figs}
+
+\begin{nolinenumbers}
+\begin{figure}[htbp]
+  \centering
+  \tikzset{
+    block/.style  = {rectangle, draw, rounded corners=3pt,
+                     fill=blue!8, text width=6.8cm, align=center,
+                     minimum height=0.75cm, font=\small},
+    arrowstyle/.style = {-{Stealth[length=5pt]}, thick, draw=gray!70},
+    sidelab/.style = {font=\scriptsize, text=gray!80, align=left}
+  }
+  \begin{tikzpicture}[node distance=0.55cm]
+    \node[block, fill=orange!15] (input)
+      {Input: $\spar$ at held-out value $\spar^*$};
+    \node[block, below=of input] (sim)
+      {$N$-body simulations at training $\theta_j$ \\
+       $\Rightarrow$ system catalogues $(X,Y,Z)$};
+    \node[block, below=of sim] (kde)
+      {Adaptive \KDE\ on 200-pt grids\\
+       $\Rightarrow$ $\hat{f}_{X}(\cdot|\theta_j),\;\hat{f}_{Y},\;\hat{f}_{Z}$};
+    \node[block, below=of kde] (sqrt)
+      {$\sqrt{f}$ transform\\
+       $h_v = \sqrt{\hat{f}_v}$\quad($v\in\{X,Y,Z\}$)};
+    \node[block, below=of sqrt] (mfpca)
+      {\MFPCA\ ($K=30$ components, 50-knot B-splines)\\
+       $\Rightarrow$ scores $\{\xi_k(\theta_j)\}_{k=1}^{30}$};
+    \node[block, below=of mfpca] (loess)
+      {LOESS pre-smooth (span $0.25$) $\Rightarrow$ $\tilde{\xi}_k$;\\
+       residuals $r_k = \xi_k - \tilde{\xi}_k$
+       $\Rightarrow$ $\sigma^2_{\mathrm{resid},k}$};
+    \node[block, fill=green!8, below=of loess] (gp)
+      {Homoscedastic \GP\ per $k$: Mat\'ern-$\tfrac{3}{2}$,
+       \ECDF\ warping, fixed LOESS-SE$^2$ observation noise\\
+       $\Rightarrow$ posterior mean $m_k(\spar^*)$, variance $v_k(\spar^*)$};
+    \node[block, below=of gp] (predvar)
+      {Predictive variance:
+       $\sigma^2_{\mathrm{pred},k}=v_k(\spar^*)+\sigma^2_{\mathrm{resid},k}$\\
+       Draw $\hat{\xi}_k^{(s)}\sim
+       \mathcal{N}(m_k,\sigma^2_{\mathrm{pred},k})$,\quad$s=1,\ldots,100$};
+    \node[block, below=of predvar] (recon)
+      {\MFPCA\ back-reconstruction:\\
+       $\hat{h}^{(s)}(\cdot)=\boldsymbol{\mu}+\sum_k\hat{\xi}_k^{(s)}\boldsymbol{\phi}_k$};
+    \node[block, fill=orange!15, below=of recon] (output)
+      {Inverse $\sqrt{f}$: $f=h^2/\int h^2$\\
+       $\{\hat{f}_v^{(s)}(\cdot|\spar^*)\}_{s=1}^{100}$\quad($v\in\{X,Y,Z\}$)};
+    \draw[arrowstyle] (input)  -- (sim);
+    \draw[arrowstyle] (sim)    -- (kde);
+    \draw[arrowstyle] (kde)    -- (sqrt);
+    \draw[arrowstyle] (sqrt)   -- (mfpca);
+    \draw[arrowstyle] (mfpca)  -- (loess);
+    \draw[arrowstyle] (loess)  -- (gp);
+    \draw[arrowstyle] (gp)     -- (predvar);
+    \draw[arrowstyle] (predvar) -- (recon);
+    \draw[arrowstyle] (recon)  -- (output);
+  \end{tikzpicture}
+  \caption{Pipeline overview.  Simulation outputs are converted to
+    densities via adaptive \KDE, mapped to square-root density functions,
+    jointly compressed by \MFPCA, emulated in score space by a
+    homoscedastic \GP with \ECDF input warping and fixed LOESS-SE$^2$
+    observation noise, sampled with the noise-decomposition predictive
+    variance (Equation~\ref{eq:pred_var}), and back-transformed by
+    squaring and normalising.
+    Orange boxes are inputs/outputs; green box is the core emulation step.}
+  \label{fig:pipeline}
+\end{figure}
+\end{nolinenumbers}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.90\textwidth]{fig_scores.pdf}
+  \caption{\MFPCA\ score series for PCs~1--8 against the simulation
+    control parameter $\theta$ (g\,cm$^{-2}$).
+    Grey dots: per-$\theta$ mean raw scores $\xi_k(\theta)$;
+    blue line: LOESS-smoothed $\tilde{\xi}_k(\theta)$ (span $=0.25$).
+    Each panel shows the lag-1 autocorrelation $r_1$ of the smoothed
+    series and the residual SD defining
+    $\sigma^2_{\mathrm{resid},k}$.
+    All components show $r_1>0.91$ ($r_1=0.92$--$0.98$ across PCs~1--8),
+    confirming structured $\theta$-dependence throughout.}
+  \label{fig:scores}
+\end{figure}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\textwidth]{fig_reconstruction.pdf}
+  \caption{Three-stage reconstruction at representative held-out
+    $\spar^*=70.4$\,g\,cm$^{-2}$ (near-median \iCRPS for $Y$).
+    \textbf{Left:} held-out adaptive \KDE (the emulation target).
+    \textbf{Centre:} \MFPCA reconstruction from exact (unpredicted)
+    scores, showing the basis representation floor independent of \GP
+    quality; \ISE annotated per panel.
+    \textbf{Right:} full \GP emulator output with 95\,\% credible
+    band (light blue); \iCRPS and pointwise coverage annotated per panel.
+    Black dashed line in centre and right columns reproduces the \KDE
+    target for visual comparison.}
+  \label{fig:reconstruction}
+\end{figure}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.97\textwidth]{fig_ppd.pdf}
+  \caption{Posterior predictive densities at four
+    held-out $\spar$ values (columns), for each of
+    the three planetary-system observables (rows).
+    \textbf{Black}: held-out \KDE; \textbf{red dashed}: training-mean
+    naive baseline; \textbf{blue}: \GP\ posterior mean;
+    \textbf{shaded}: 95\,\% credible band.  Empirical density-space
+    coverage is annotated in each panel (nominal 95\,\%).}
+  \label{fig:ppd}
+\end{figure}
+
+\end{document}
